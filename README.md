@@ -87,8 +87,15 @@ scripts/
 
 ⚙️ Installation
 1. Install Dependencies
+   
+	conda create --name xyz python==3.10
+	
+	conda activate xyz
+	
+	conda install jupyter nbconvert
+	
+	conda install --file requirements.txt -c conda-forge
 
-   conda install -r requirements.txt
    
 3. Prepare Input Data
    
