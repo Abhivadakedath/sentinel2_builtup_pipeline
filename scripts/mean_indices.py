@@ -5,7 +5,7 @@
 Monthly → Tile-level Indices (Sentinel-2)
 
 • One image per month
-• Compute selected indices
+• Compute selected indices (NDVI, NDBI, BSI, MNDWI, SAVI, IBI)
 • Aggregate monthly rasters → MEAN + MEDIAN per tile
 • Skips months already processed
 • Memory-safe aggregation using xarray + dask
@@ -22,9 +22,15 @@ import xarray as xr
 import rioxarray as rxr
 from dask.diagnostics import ProgressBar
 
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("monthly-indices")
 
+# --------------------------------------------------
+# Constants
+# --------------------------------------------------
 MONTHS = [
     "January","February","March","April","May","June",
     "July","August","September","October","November","December"
@@ -39,12 +45,24 @@ def safe_div(a, b):
         r[~np.isfinite(r)] = np.nan
     return r
 
-def NDVI(b08, b04): return safe_div(b08, b04)
-def NDBI(b11, b08): return safe_div(b11, b08)
+def NDVI(b08, b04):
+    return safe_div(b08, b04)
+
+def NDBI(b11, b08):
+    return safe_div(b11, b08)
+
 def BSI(b11, b04, b08, b02):
     return safe_div((b11 + b04) - (b08 + b02),
                     (b11 + b04) + (b08 + b02))
-def MNDWI(b03, b11): return safe_div(b03, b11)
+
+def MNDWI(b03, b11):
+    return safe_div(b03, b11)
+
+def SAVI(b08, b04, L=0.5):
+    return (1 + L) * (b08 - b04) / (b08 + b04 + L)
+
+def IBI(ndbi, savi, mndwi):
+    return (ndbi - (savi + mndwi) / 2) / (ndbi + (savi + mndwi) / 2)
 
 # --------------------------------------------------
 # Raster helpers
@@ -81,9 +99,10 @@ def monthly_indices_exist(idx_dir: Path, itemid: str, indices):
     )
 
 # --------------------------------------------------
-# STEP 1 — Monthly indices (SKIP IF EXISTS)
+# STEP 1 — Monthly indices
 # --------------------------------------------------
 def compute_monthly_indices(tile_dir: Path, indices, overwrite=False):
+
     for month in MONTHS:
         m10 = tile_dir / month / "10m"
         m20 = tile_dir / month / "20m"
@@ -99,41 +118,45 @@ def compute_monthly_indices(tile_dir: Path, indices, overwrite=False):
 
         itemid = b08_files[0].stem.replace("_B08", "")
 
-        # 🔁 Skip if already done
         if not overwrite and monthly_indices_exist(idx_dir, itemid, indices):
-            log.info("[%s %s] indices already exist → skipped", tile_dir.name, month)
+            log.info("[%s %s] indices exist → skipped", tile_dir.name, month)
             continue
 
         try:
-            b08, prof = read_band(m10 / f"{itemid}_B08.tif")
-            b04, _ = read_band(m10 / f"{itemid}_B04.tif")
+            # --- Read 10m bands ---
+            b08, prof = read_band(m10 / f"{itemid}_B08.tif")  # NIR
+            b04, _    = read_band(m10 / f"{itemid}_B04.tif")  # Red
+            b03, _    = read_band(m10 / f"{itemid}_B03.tif")  # Green
+            b02, _    = read_band(m10 / f"{itemid}_B02.tif")  # Blue
+
+            # --- Read & resample SWIR ---
+            b11, p11 = read_band(m20 / f"{itemid}_B11.tif")
+            if p11["width"] != prof["width"]:
+                b11 = resample(b11, p11, prof)
+
+            # --- Core indices ---
+            ndbi = NDBI(b11, b08)
+            savi = SAVI(b08, b04)
+            mndwi = MNDWI(b03, b11)
 
             if "NDVI" in indices:
-                out = idx_dir / f"{itemid}_NDVI.tif"
-                if overwrite or not out.exists():
-                    write(out, NDVI(b08, b04), prof)
-
-            if any(i in indices for i in ("NDBI","BSI","MNDWI")):
-                b11, p11 = read_band(m20 / f"{itemid}_B11.tif")
-                if p11["width"] != prof["width"]:
-                    b11 = resample(b11, p11, prof)
+                write(idx_dir / f"{itemid}_NDVI.tif", NDVI(b08, b04), prof)
 
             if "NDBI" in indices:
-                out = idx_dir / f"{itemid}_NDBI.tif"
-                if overwrite or not out.exists():
-                    write(out, NDBI(b11, b08), prof)
+                write(idx_dir / f"{itemid}_NDBI.tif", ndbi, prof)
 
             if "BSI" in indices:
-                out = idx_dir / f"{itemid}_BSI.tif"
-                if overwrite or not out.exists():
-                    b02, _ = read_band(m10 / f"{itemid}_B02.tif")
-                    write(out, BSI(b11, b04, b08, b02), prof)
+                write(idx_dir / f"{itemid}_BSI.tif", BSI(b11, b04, b08, b02), prof)
 
             if "MNDWI" in indices:
-                out = idx_dir / f"{itemid}_MNDWI.tif"
-                if overwrite or not out.exists():
-                    b03, _ = read_band(m10 / f"{itemid}_B03.tif")
-                    write(out, MNDWI(b03, b11), prof)
+                write(idx_dir / f"{itemid}_MNDWI.tif", mndwi, prof)
+
+            if "SAVI" in indices:
+                write(idx_dir / f"{itemid}_SAVI.tif", savi, prof)
+
+            if "IBI" in indices:
+                ibi = IBI(ndbi, savi, mndwi)
+                write(idx_dir / f"{itemid}_IBI.tif", ibi, prof)
 
             log.info("[%s %s] monthly indices processed", tile_dir.name, month)
 
@@ -144,6 +167,7 @@ def compute_monthly_indices(tile_dir: Path, indices, overwrite=False):
 # STEP 2 — Tile aggregation (xarray + dask)
 # --------------------------------------------------
 def aggregate_tile(tile_dir: Path, indices, do_mean=True, do_median=True):
+
     outdir = tile_dir / "indices"
     outdir.mkdir(exist_ok=True)
 
@@ -153,7 +177,7 @@ def aggregate_tile(tile_dir: Path, indices, do_mean=True, do_median=True):
             continue
 
         da_list = [
-            rxr.open_rasterio(r, chunks={"x": 1024, "y": 1024}).squeeze()
+            rxr.open_rasterio(r, chunks={"x": 512, "y": 512}).squeeze()
             for r in rasters
         ]
 
@@ -162,19 +186,16 @@ def aggregate_tile(tile_dir: Path, indices, do_mean=True, do_median=True):
         with ProgressBar():
             if do_mean:
                 mean = stack.mean(dim="time", skipna=True)
-                mean.rio.to_raster(
-                    outdir / f"{tile_dir.name}_MEAN_{idx}.tif",
-                    compress="DEFLATE"
-                )
+                mean.rio.to_raster(outdir / f"{tile_dir.name}_MEAN_{idx}.tif",
+                                   compress="DEFLATE")
 
             if do_median:
                 median = stack.median(dim="time", skipna=True)
-                median.rio.to_raster(
-                    outdir / f"{tile_dir.name}_MEDIAN_{idx}.tif",
-                    compress="DEFLATE"
-                )
+                median.rio.to_raster(outdir / f"{tile_dir.name}_MEDIAN_{idx}.tif",
+                                     compress="DEFLATE")
 
-        log.info("[%s] aggregated %s (mean + median)", tile_dir.name, idx)
+        del stack, da_list
+        log.info("[%s] aggregated %s", tile_dir.name, idx)
 
 # --------------------------------------------------
 # RUN
@@ -182,7 +203,7 @@ def aggregate_tile(tile_dir: Path, indices, do_mean=True, do_median=True):
 def run(
     root="data/sentinel",
     tiles=None,
-    indices=("NDVI","NDBI","BSI","MNDWI"),
+    indices=("NDVI","NDBI","BSI","MNDWI","SAVI","IBI"),
     aggregate_mean=True,
     aggregate_median=True,
     overwrite_monthly=False,
