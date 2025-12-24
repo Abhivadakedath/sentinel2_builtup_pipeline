@@ -207,7 +207,7 @@ def run(outdir=DEFAULT_OUTDIR, aoi_path=DEFAULT_AOI, year=DEFAULT_YEAR):
         items_by_tile[detect_tile_id(it)].append(it)
 
     for tile, tile_items in items_by_tile.items():
-        tile_dir = outdir / tile
+        tile_dir = outdir / tile / str(year)
         tile_dir.mkdir(parents=True, exist_ok=True)
 
         monthly_items, report = select_monthly_items(tile_items)
